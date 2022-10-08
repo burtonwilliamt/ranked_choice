@@ -1,5 +1,9 @@
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence
+from collections import namedtuple
 import csv
+import sys
+
+CANDIDATE_PADDING = 0
 
 
 class Ballot:
@@ -11,7 +15,9 @@ class Ballot:
             string representation of the candidate. preference_stack[0] is the
             most preferred.
     """
-    def __init__(self, survey_response_line: Sequence[str], candidates: Sequence[str]):
+
+    def __init__(self, survey_response_line: Sequence[str],
+                 candidates: Sequence[str]):
         """Constructs a single Ballot object.
 
         Args:
@@ -32,17 +38,33 @@ class Ballot:
                     'Steam game (max $70)',
                 ]
         """
-        assert len(survey_response_line) == len(candidates)+1, 'This survey response doesn\'t have the correct number of rankings'
+        assert len(survey_response_line) == len(
+            candidates
+        ) + 1, 'This survey response doesn\'t have the correct number of rankings'
         self.timestamp = survey_response_line[0]
         survey_response = [int(i) for i in survey_response_line[1:]]
 
         self.preference_stack = [None] * len(candidates)
-        assert set(survey_response) == set(range(1, len(candidates)+1)), 'Survey response should have exactly one candidate for each rank.'
+        assert set(survey_response) == set(
+            range(1,
+                  len(candidates) + 1)
+        ), 'Survey response should have exactly one candidate for each rank.'
         for candidate_num, rank_of_candidate in enumerate(survey_response):
-            self.preference_stack[rank_of_candidate-1] = candidates[candidate_num]
+            self.preference_stack[rank_of_candidate -
+                                  1] = candidates[candidate_num]
 
     def __str__(self):
-        return f'Ballot<{self.preference_stack}>'
+        candidates = ', '.join([
+            f'\'{c.rjust(CANDIDATE_PADDING)}\'' for c in self.preference_stack
+        ])
+        return f'Ballot<[{candidates}]>'
+
+    def remove_candidate(self, candidate: str):
+        self.preference_stack.remove(candidate)
+
+
+CandidateCountAtRank = namedtuple('CandidateCountAtRank',
+                                  ['candidate', 'count'])
 
 
 class Votes:
@@ -61,18 +83,22 @@ class Votes:
 
         self._candidates = votes_array[0][1:]
         self._simplify_candidate_names()
+        global CANDIDATE_PADDING
+        CANDIDATE_PADDING = max([len(c) for c in self._candidates])
 
         print(f'The candidates were: {self._candidates}')
-        
-        self._ballots = [Ballot(line, self._candidates) for line in votes_array[1:]]
+
+        self._ballots = [
+            Ballot(line, self._candidates) for line in votes_array[1:]
+        ]
         print('The parsed ballots:')
-        for b in self._ballots:
-            print(b)
-        # Sort the ballots so that they get grouped by first choice and so on.
-        self._ballots.sort(key=str) 
+        print(self)
+        self._sort_ballots()
         print('After sorting:')
-        for b in self._ballots:
-            print(b)
+        print(self)
+
+    def __str__(self):
+        return '\n'.join(['\t' + str(b) for b in self._ballots])
 
     def _simplify_candidate_names(self):
         # Google survey includes the original question as a prefix on each
@@ -86,13 +112,90 @@ class Votes:
             return
         len_question_asked = len(self._candidates[0].split('[')[0])
         for i, candidate in enumerate(self._candidates):
-            self._candidates[i] = candidate[len_question_asked+1:-1]
+            self._candidates[i] = candidate[len_question_asked + 1:-1]
+
+    def _sort_ballots(self):
+        """Sorts the ballots so that they get grouped by first choice and so on."""
+        self._ballots.sort(key=str)
+
+    def _candidate_counts_at_rank(self, rank: int) -> list[tuple[str, int]]:
+        """Counts how many times each candidate appeared at specified rank."""
+        counts_at_rank = {}
+        for ballot in self._ballots:
+            choice = ballot.preference_stack[rank]
+            counts_at_rank[choice] = counts_at_rank.get(choice, 0) + 1
+        res = [
+            CandidateCountAtRank(candidate=choice, count=count)
+            for choice, count in counts_at_rank.items()
+        ]
+        res.sort(key=lambda x: x.count, reverse=True)
+        return res
 
     def clear_winner(self) -> Optional[str]:
-        pass
+        first_choice_counts = self._candidate_counts_at_rank(0)
+        if first_choice_counts[0].count > len(self._ballots) / 2:
+            print(
+                f'Candidate {first_choice_counts[0].candidate} has {first_choice_counts[0].count} votes which is more than a majority ({len(self._ballots)/2})'
+            )
+            return first_choice_counts[0].candidate
+        return None
+
+    def _remove_candidate(self, candidate: str):
+        for ballot in self._ballots:
+            ballot.remove_candidate(candidate)
+        self._candidates.remove(candidate)
+        self._sort_ballots()
 
     def remove_least_popular(self) -> str:
-        pass
+        """Removes the least popular candidate from all ballots.
+        
+        If one candidate has a majority of the last rank, it is removed. If
+        there is a tie it is broken by proceeding up the ranks until one
+        candidate has more votes. That candidate will be removed.
+
+        For example:
+        1st      4th
+        A, B, C, D
+        A, B, C, D
+        B, A, D, C
+        D, B, A, C
+        
+        D and C are tied for 4th rank. To find which one should "lose" we
+        proceed up to the next rank (3rd) and check again. Only considering D
+        and C, in the third rank C has more votes so we should remove C.
+
+        Intuitively, this happens when an equal number of people place C and D
+        in last rank, but the people who didn't place D in last place favor it
+        much more than the people who didn't place C in last place favor C.
+        """
+        current_rank = len(self._candidates) - 1
+
+        potential_losers = set(self._candidates)
+        while current_rank >= 0:
+            current_rank_counts = list(filter(
+                lambda x: x.candidate in potential_losers,
+                self._candidate_counts_at_rank(current_rank)))
+
+            print(f'Count of choices at rank {current_rank}:')
+            for choice, count in current_rank_counts:
+                print(f'\t{choice.ljust(CANDIDATE_PADDING)}: {count}')
+
+            if current_rank_counts[0].count > current_rank_counts[1].count:
+                loser = current_rank_counts[0].candidate
+                print(
+                    f'Last place is \'{loser}\' with {current_rank_counts[0].count} votes in rank {current_rank}.'
+                )
+                self._remove_candidate(loser)
+                return loser
+
+            plurality_count = current_rank_counts[0].count
+            potential_losers = {
+                choice for choice, count in current_rank_counts
+                if count == plurality_count
+            }
+            print(f'Last place is tied between {potential_losers}')
+            current_rank -= 1
+        raise ValueError('The remaining choices are tied, cannot select a winner.')
 
 
 def read_votes(file: str) -> Votes:
@@ -103,8 +206,12 @@ def read_votes(file: str) -> Votes:
 
 
 def main():
-    print('Starting the ranked choice vote count.')
-    path = 'the_votes.csv'  # TODO: Take this as a command argument.
+    if len(sys.argv) != 2:
+        print(f'Usage: $python {sys.argv[0]} rel/path/to/votes.csv')
+        return
+    path = sys.argv[1]
+
+    print('Reading the votes from file...')
     votes = read_votes(path)
 
     while True:
@@ -112,9 +219,9 @@ def main():
         if winner is not None:
             print(f'Winner found!\nThe winner is {winner}')
             break
-        removed = votes.remove_lease_popular()
-        print(f'Removed {removed}')
-        print(f'Remaining votes: {votes}')
+        removed = votes.remove_least_popular()
+        print(f'Removed \'{removed}\'')
+        print(f'Remaining votes:\n{votes}')
 
 
 if __name__ == '__main__':
