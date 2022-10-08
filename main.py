@@ -4,6 +4,7 @@ import csv
 import sys
 
 CANDIDATE_PADDING = 0
+MAXIMUM_WIDTH = 200
 
 
 class Ballot:
@@ -24,19 +25,11 @@ class Ballot:
             survey_response_line (Sequence[str]): The individual survey 
                 response. This is a row taken out of the google sheet, for
                 example:
-                ['9/6/2022 21:30:21', '3', '2', '7', '6', '5', '1', '4']
-            candidates (Sequence[str]): The ordered list of candidates. These
-                were the titles of each column except for the "Timestamp"
+                ['9/6/2022 21:30:21', '1', '3', '2']
+            candidates (Sequence[str]): The list of candidates ordered as they
+                were in the column titles and should exclude the "Timestamp"
                 column. For example:
-                [
-                    'Miller Lite',
-                    'Money $10 buy in',
-                    'Ability to mute people in discord',
-                    'Intro track when joining discord',
-                    'Other discord feature',
-                    'Chooses the cookie (see below)',
-                    'Steam game (max $70)',
-                ]
+                ['Bob', 'Sue', 'Bill']
         """
         assert len(survey_response_line) == len(
             candidates
@@ -54,8 +47,12 @@ class Ballot:
                                   1] = candidates[candidate_num]
 
     def __str__(self):
+        padding = CANDIDATE_PADDING
+        if padding * len(self.preference_stack) > MAXIMUM_WIDTH:
+            padding = MAXIMUM_WIDTH // len(self.preference_stack)
         candidates = ', '.join([
-            f'\'{c.rjust(CANDIDATE_PADDING)}\'' for c in self.preference_stack
+            f'\'{c[0:padding].rjust(padding)}\''
+            for c in self.preference_stack
         ])
         return f'Ballot<[{candidates}]>'
 
@@ -118,12 +115,13 @@ class Votes:
         """Sorts the ballots so that they get grouped by first choice and so on."""
         self._ballots.sort(key=str)
 
-    def _candidate_counts_at_rank(self, rank: int) -> list[tuple[str, int]]:
+    def _candidate_counts_at_rank(self,
+                                  rank: int) -> list[CandidateCountAtRank]:
         """Counts how many times each candidate appeared at specified rank."""
-        counts_at_rank = {}
+        counts_at_rank = {c: 0 for c in self._candidates}
         for ballot in self._ballots:
             choice = ballot.preference_stack[rank]
-            counts_at_rank[choice] = counts_at_rank.get(choice, 0) + 1
+            counts_at_rank[choice] += 1
         res = [
             CandidateCountAtRank(candidate=choice, count=count)
             for choice, count in counts_at_rank.items()
@@ -132,12 +130,12 @@ class Votes:
         return res
 
     def clear_winner(self) -> Optional[str]:
-        first_choice_counts = self._candidate_counts_at_rank(0)
-        if first_choice_counts[0].count > len(self._ballots) / 2:
+        winner = self._candidate_counts_at_rank(0)[0]
+        if winner.count > len(self._ballots) / 2:
             print(
-                f'Candidate {first_choice_counts[0].candidate} has {first_choice_counts[0].count} votes which is more than a majority ({len(self._ballots)/2})'
+                f'Candidate {winner.candidate} has {winner.count} votes which is more than a majority ({len(self._ballots)/2})'
             )
-            return first_choice_counts[0].candidate
+            return winner.candidate
         return None
 
     def _remove_candidate(self, candidate: str):
@@ -146,7 +144,18 @@ class Votes:
         self._candidates.remove(candidate)
         self._sort_ballots()
 
-    def remove_least_popular(self) -> str:
+    def _count_potential_losers(self, potential_losers: Sequence[str],
+                                rank: int) -> list[CandidateCountAtRank]:
+        counts = list(
+            filter(lambda x: x.candidate in potential_losers,
+                   self._candidate_counts_at_rank(rank)))
+
+        print(f'Count of potential losers at rank {rank+1}:')
+        for choice, count in counts:
+            print(f'\t{choice.ljust(CANDIDATE_PADDING)}: {count}')
+        return counts
+
+    def remove_strongest_loser(self) -> str:
         """Removes the least popular candidate from all ballots.
         
         If one candidate has a majority of the last rank, it is removed. If
@@ -172,14 +181,8 @@ class Votes:
 
         potential_losers = set(self._candidates)
         while current_rank >= 0:
-            current_rank_counts = list(filter(
-                lambda x: x.candidate in potential_losers,
-                self._candidate_counts_at_rank(current_rank)))
-
-            print(f'Count of choices at rank {current_rank}:')
-            for choice, count in current_rank_counts:
-                print(f'\t{choice.ljust(CANDIDATE_PADDING)}: {count}')
-
+            current_rank_counts = self._count_potential_losers(
+                potential_losers, current_rank)
             if current_rank_counts[0].count > current_rank_counts[1].count:
                 loser = current_rank_counts[0].candidate
                 print(
@@ -194,8 +197,54 @@ class Votes:
                 if count == plurality_count
             }
             print(f'Last place is tied between {potential_losers}')
+            print(
+                'We will now look higher in people\'s preferences to find out which candidate appears in the bottom of people\'s priorities.'
+            )
             current_rank -= 1
-        raise ValueError('The remaining choices are tied, cannot select a winner.')
+        raise ValueError(
+            'The remaining choices are tied for least preferred, cannot select the strongest loser.'
+        )
+
+    def remove_weakest_winner(self) -> str:
+        """Similar to strongest loser, but removes lowest voted from first.
+        
+        This is more true to what the instant runoff algorithm describes on the
+        wikipedia page.
+        ```
+        * Eliminate the candidate appearing as the first preference on the fewest ballots.
+        * If only one candidate remains, elect this candidate and stop.
+        * Otherwise go to 1.
+        ```
+        """
+        current_rank = 0
+        potential_losers = set(self._candidates)
+        while current_rank < len(self._candidates):
+            current_rank_counts = self._count_potential_losers(
+                potential_losers, current_rank)
+
+            if current_rank_counts[-1].count < current_rank_counts[-2].count:
+                loser = current_rank_counts[-1].candidate
+                print(
+                    f'Candidate \'{loser}\' had the least votes ({current_rank_counts[-1].count}) at rank {current_rank+1}.'
+                )
+                self._remove_candidate(loser)
+                return loser
+
+            lowest_count = current_rank_counts[-1].count
+            potential_losers = {
+                choice for choice, count in current_rank_counts
+                if count == lowest_count
+            }
+            print(
+                f'Weakest contender for first is tied between {potential_losers}'
+            )
+            print(
+                'We will now look further down people\'s preferences to find out which is the weakest contender.'
+            )
+            current_rank += 1
+        raise ValueError(
+            'The remaining choices are tied, cannot select the weakest winner to remove.'
+        )
 
 
 def read_votes(file: str) -> Votes:
@@ -219,7 +268,7 @@ def main():
         if winner is not None:
             print(f'Winner found!\nThe winner is {winner}')
             break
-        removed = votes.remove_least_popular()
+        removed = votes.remove_weakest_winner()
         print(f'Removed \'{removed}\'')
         print(f'Remaining votes:\n{votes}')
 
